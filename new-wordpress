@@ -21,10 +21,17 @@ cd "$BASEDIR" || exit 1
 
 # Init DDEV project
 ddev config --project-type=wordpress --docroot=web --project-name=$SITENAME
-ddev start
+ddev start || exit 1
 
-# Install Bedrock inside DDEV
-ddev composer create-project roots/bedrock web
+# 🛠 Wait until containers are ready before running Composer
+echo "⌛ Waiting for DDEV containers to be fully ready..."
+sleep 5
+
+# ✅ Install Bedrock
+ddev composer create-project roots/bedrock web || {
+  echo "❌ Composer install failed"
+  exit 1
+}
 
 # Set up .env
 cp web/.env.example web/.env
@@ -34,6 +41,3 @@ sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=db|" web/.env
 sed -i "s|DB_HOST=.*|DB_HOST=db|" web/.env
 sed -i "s|WP_HOME=.*|WP_HOME=https://${SITENAME}.ddev.site|" web/.env
 sed -i "s|WP_SITEURL=.*|WP_SITEURL=https://${SITENAME}.ddev.site/wp|" web/.env
-
-echo "✅ Site created: $SITENAME"
-echo "🌐 Visit: https://${SITENAME}.ddev.site"
