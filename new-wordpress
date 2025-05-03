@@ -1,21 +1,27 @@
 #!/bin/bash
 
-# Prompt for site name
-read -p "Enter site name (e.g. client1): " SITENAME
+ADJECTIVES=(calm clever tiny bold noisy shy brave eager swift wise lucky jolly sunny spicy chilly bright cozy sharp quick silent frosty sweet bitter bouncy sleepy crisp zesty mellow dusty fresh smooth gentle crispy fizzy greedy itchy salty stormy funky gloomy hazy quiet breezy cheery lively proud snug neat lazy harsh vivid)
+NOUNS=(cactus river fox owl pine ocean stone breeze field sun mountain leaf branch fire cloud sky star tree glacier pebble cave rain fog dune sand lake comet island garden frost thunder shadow echo drift stream moon path flower root vine tide snow flame cliff)
 
-# Create site directory
-BASEDIR=~/websites/${SITENAME}-website
+# Generate unique sitename
+while true; do
+  ADJ=${ADJECTIVES[$RANDOM % ${#ADJECTIVES[@]}]}
+  NOUN=${NOUNS[$RANDOM % ${#NOUNS[@]}]}
+  SITENAME="${ADJ}${NOUN}"
+  BASEDIR=~/websites/$SITENAME
+  [ ! -d "$BASEDIR" ] && break
+done
+
+echo "🔧 Using sitename: $SITENAME"
+
 mkdir -p "$BASEDIR"
 cd "$BASEDIR" || exit 1
 
-# Initialize DDEV project here
 ddev config --project-type=wordpress --docroot=web --project-name=$SITENAME
 ddev start || exit 1
 
-# Install Bedrock inside the web folder
 composer create-project roots/bedrock web || exit 1
 
-# Setup .env file
 cp web/.env.example web/.env
 sed -i "s|DB_NAME=.*|DB_NAME=db|" web/.env
 sed -i "s|DB_USER=.*|DB_USER=db|" web/.env
