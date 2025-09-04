@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Configuration Variables ---
+SCRIPTS_DIR="$HOME/scripts"
+CREDENTIALS_DIR="$SCRIPTS_DIR/credentials"
+CLOUDWAYS_CREDENTIALS_FILE="$CREDENTIALS_DIR/.cloudways_credentials"
+CLOUDWAYS_API_BASE_URL="https://api.cloudways.com/api/v1"
+CLOUDWAYS_DEFAULT_APP_TYPE="wordpressdefault"
+CLOUDWAYS_DEFAULT_APP_VERSION="6.2.2"
+CLOUDFLARE_BASE_DOMAIN="jeffreyleong.xyz"
+
+# --- Helper Functions ---
+info() { echo "[INFO] $1" >&2; }
+success() { echo "✅ SUCCESS: $1" >&2; }
+error() { echo "❌ ERROR: $1" >&2; return 1; }
+warn() { echo "⚠️ WARNING: $1" >&2; }
+
+# --- Dependency Check Function ---
+check_and_install_dependencies() {
+  local packages_to_install=()
+  local package_name
+  info "Checking for required script dependencies..."
+  for package_name in "$@"; do
+    if ! command -v "$package_name" > /dev/null 2>&1; then
+      warn "Required command '$package_name' not found."
+      packages_to_install+=("$package_name")
+    fi
+  done
+
+  if [ ${#packages_to_install[@]} -gt 0 ]; then
+    error "One or more required dependencies are missing: ${packages_to_install[*]}. Please install them manually and try again."
+    exit 1
+  else
+    success "All checked script dependencies are present."
+  fi
+  echo
+}
+
+# --- Cloudways API Functions ---
+CLOUDWAYS_ACCESS_TOKEN=""
+SELECTED_SERVER_IP=""
+
+load_cloudways_credentials() {
+    info "Loading Cloudways credentials..."
+    if [ ! -f "$CLOUDWAYS_CREDENTIALS_FILE" ]; then
+        info "Creating credentials folder and file..."
+        mkdir -p "$CREDENTIALS_DIR"
+        touch "$CLOUDWAYS_CREDENTIALS_FILE"
+        chmod 600 "$CLOUDWAYS_CREDENTIALS_FILE"
+        error "Cloudways credentials file '$CLOUDWAYS_CREDENTIALS_FILE' not found. Please create it and store your credentials."
+    fi
+    source "$CLOUDWAYS_CREDENTIALS_FILE"
+    if [ -z "${EMAIL:-}" ] || [ -z "${API_KEY:-}" ]; then
+        error "EMAIL or API_KEY not found in '$CLOUDWAYS_CREDENTIALS_FILE'. Please ensure the file is correctly formatted."
+    fi
+    success "Cloudways credentials loaded."
+    return 0
+}
+
+get_cloudways_access_token() {
+    info "Getting Cloudways API access token..."
+    load_cloudways_credentials || return 1
+
+    local TOKEN_RESPONSE
+    TOKEN_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"email\": \"$EMAIL\", \"api_key\": \"$API_KEY\"}" "$CLOUDWAYS_API_BASE_URL/oauth/access_token")
+    CLOUDWAYS_ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
+    if [ -z "$CLOUDWAYS_ACCESS_TOKEN" ] || [ "$CLOUDWAYS_ACCESS_TOKEN" = "null" ]; then
+        error "Could not get Cloudways access token. Please check your credentials. Response: $TOKEN_RESPONSE"
+        return 1
+    fi
+    success "Cloudways access token obtained."
+    return 0
+}
+
+cloudways_api_call() {
+  local method="$1" path="$2" data_type="$3" data="${4:-}"
+  local raw_response http_code response_body
+
+  if [ -z "$CLOUDWAYS_ACCESS_TOKEN" ]; then
+    error "Cloudways API Access Token is not loaded for API call: $path"
+    return 1
+  fi
+
+  local curl_cmd=("curl" "-s" "-w" "\n%{http_code}" -H "Authorization: Bearer $CLOUDWAYS_ACCESS_TOKEN" -H "Accept: application/json" -X "$method")
+
+  if [ "$data_type" == "json" ]; then
+      curl_cmd+=("-H" "Content-Type: application/json" "--data" "$data")
+  elif [ "$data_type" == "form" ]; then
+      curl_cmd+=("-H" "Content-Type: application/x-www-form-urlencoded" "--data" "$data")
+  fi
+
+  raw_response=$("${curl_cmd[@]}" "$CLOUDWAYS_API_BASE_URL/$path")
+
+  http_code=$(echo "$raw_response" | tail -n1)
+  response_body=$(echo "$raw_response" | sed '$d')
+
+  if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+      if [[ "$response_body" =~ ^\{\}$ ]] || \
+         echo "$response_body" | jq -e '.success == true' >/dev/null || \
+         echo "$response_body" | jq -e '.status == true' >/dev/null || \
+         echo "$response_body" | jq -e '.operation_id' >/dev/null; then
+          echo "$response_body"
+          return 0
+      else
+          warn "Cloudways API: Ambiguous success for $method $path (Code: $http_code)."
+          warn "Response body: $response_body"
+          echo "$response_body"
+          return 0
+      fi
+  else
+      error "Cloudways API Error! Method: $method, Path: $path, Code: $http_code. Response:\n$response_body"
+      return 1
+  fi
+}
+
+wait_for_operation() {
+    local op_id=$1
+    local timeout=1800 interval=10 elapsed=0
+    echo -n "       Waiting for Cloudways operation #$op_id to complete..."
+    while (( elapsed < timeout )); do
+        local op_status_response
+        op_status_response=$(curl -s -X GET -H "Authorization: Bearer $ACCESS_TOKEN" "$API_URL/operation/$op_id")
+        local is_completed=$(echo "$op_status_response" | jq -r '.operation.is_completed')
+        
+        if [[ "$is_completed" == "1" ]]; then
+            echo " Done."
+            break
+        fi
+        echo -n "."
+        sleep 15
+        (( elapsed += interval ))
+    done
+    if (( elapsed >= timeout )); then
+        error "Operation $op_id timed out."
+    fi
+}
+
+create_and_configure_app() {
+    local server_id="$1" app_label="$2" domain="$3" is_bedrock="$4"
+    local create_data="server_id=$server_id&application=wordpressdefault&app_label=$app_label&project_name=Client%20Sites"
+    local create_response op_id
+
+    info "Creating new Cloudways application: '$app_label' on server ID $server_id..."
+    create_response=$(curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      -H "Accept: application/json" \
+      -d "$create_data" \
+      "$API_URL/app")
+      
+    op_id=$(echo "$create_response" | jq -r '.operation_id')
+    if [ -z "$op_id" ] || [ "$op_id" == "null" ]; then
+      error "Failed to start app creation. Response:\n$create_response"
+    fi
+    wait_for_operation "$op_id"
+
+    info "Waiting for app to initialize before configuration..."
+    sleep 30
+    
+    info "Fetching details for '$app_label'..."
+    local server_details app_data app_id sys_user fqdn
+    server_details=$(curl -s -X GET -H "Authorization: Bearer $ACCESS_TOKEN" "$API_URL/server")
+    app_data=$(echo "$server_details" | jq -r --arg l "$app_label" '.servers[] | .apps[] | select(.label == $l) | .')
+    app_id=$(echo "$app_data" | jq -r '.id')
+    sys_user=$(echo "$app_data" | jq -r '.sys_user')
+    fqdn=$(echo "$app_data" | jq -r '.app_fqdn')
+    
+    if [ -z "$app_id" ] || [ "$app_id" == "null" ]; then
+        error "Could not find new application ID for '$app_label'."
+    fi
+    success "App '$app_label' created with ID: $app_id"
+    
+    if [[ "$is_bedrock" == "y" ]]; then
+        info "Setting Bedrock webroot for '$app_label'..."
+        local webroot_data="server_id=$server_id&app_id=$app_id&webroot=web"
+        cloudways_api_call "POST" "app/manage/webroot" "$webroot_data"
+        success "Webroot set."
+    fi
+
+    echo "$app_id|$sys_user|$fqdn"
+}
+
+# --- Main Execution ---
+check_dependencies jq curl
+# load_cloudways_credentials # Removed as get_cloudways_access_token calls it
+get_cloudways_access_token
+# load_cloudflare_secrets # Removed as the script no longer uses Cloudflare's API
+
+read -p "Enter client's project name (or press Enter for a random one): " PROJECT_NAME_INPUT
+if [ -z "$PROJECT_NAME_INPUT" ]; then
+    moves=(tackle scratch ember watergun thunderbolt quickattack vinewhip razorleaf icebeam)
+    while :; do
+        idx=$((RANDOM % ${#moves[@]}))
+        PROJECT_NAME=${moves[$idx]}
+        if ! cloudways_api_call GET server | jq -e ".servers[].apps[] | select(.label == \"$PROJECT_NAME-staging\")" >/dev/null; then
+            break
+        fi
+    done
+    info "No custom name provided. Using a random one: $PROJECT_NAME"
+else
+    PROJECT_NAME="$PROJECT_NAME_INPUT"
+fi
+PROJECT_SLUG=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/--+/-/g' | sed -E 's/^-+|-+$//g')
+
+read -p "Enter live domain (optional, press Enter to skip): " LIVE_DOMAIN
+if [ -z "$LIVE_DOMAIN" ]; then
+    LIVE_DOMAIN_FLAG=0
+    info "Live domain not provided. Skipping live app provisioning."
+else
+    LIVE_DOMAIN_FLAG=1
+fi
+
+read -p "Is this for a Bedrock project? (y/n): " IS_BEDROCK
+IS_BEDROCK=$(echo "$IS_BEDROCK" | tr '[:upper:]' '[:lower:]')
+
+STAGING_DOMAIN="${PROJECT_SLUG}.${CLOUDFLARE_BASE_DOMAIN}"
+
+info "Fetching servers..."
+server_list_json=$(cloudways_api_call GET server)
+mapfile -t server_labels < <(echo "$server_list_json" | jq -r '.servers[].label')
+
+PS3="Select a server: "
+select server_label in "${server_labels[@]}"; do
+    if [ -n "$server_label" ]; then
+        SELECTED_SERVER_ID=$(echo "$server_list_json" | jq -r --arg l "$server_label" '.servers[] | select(.label == $l) | .id')
+        SELECTED_SERVER_IP=$(echo "$server_list_json" | jq -r --arg l "$server_label" '.servers[] | select(.label == $l) | .public_ip')
+        break
+    else
+        warn "Invalid selection."
+    fi
+done
+
+# --- Provision Staging App ---
+info "--- Staging App Provisioning ---"
+STAGING_APP_LABEL="${PROJECT_SLUG}-staging"
+IFS='|' read -r STAGING_ID STAGING_USER STAGING_FQDN <<< "$(create_and_configure_app "$SELECTED_SERVER_ID" "$STAGING_APP_LABEL" "$STAGING_DOMAIN")"
+success "Staging App created: $STAGING_APP_LABEL (ID: $STAGING_ID)"
+
+# --- Provision Live App (conditional) ---
+if [[ "$LIVE_DOMAIN_FLAG" == 1 ]]; then
+    info "--- Live App Provisioning ---"
+    LIVE_APP_LABEL="${PROJECT_SLUG}-live"
+    IFS='|' read -r LIVE_ID LIVE_USER LIVE_FQDN <<< "$(create_and_configure_app "$SELECTED_SERVER_ID" "$LIVE_APP_LABEL" "$LIVE_DOMAIN")"
+    success "Live App created: $LIVE_APP_LABEL (ID: $LIVE_ID)"
+fi
+
+# --- Final Summary ---
+cat <<EOF
+
+🎉 New Client Setup Complete!
+
+--- Staging Environment ---
+Label:     $STAGING_APP_LABEL
+ID:        $STAGING_ID
+URL:       https://$STAGING_DOMAIN
+FQDN:      https://$STAGING_FQDN
+System User: $STAGING_USER
+
+EOF
+
+if [[ "$LIVE_DOMAIN_FLAG" == 1 ]]; then
+cat <<EOF
+--- Live Environment ---
+Label:     $LIVE_APP_LABEL
+ID:        $LIVE_ID
+URL:       https://$LIVE_DOMAIN
+FQDN:      https://$LIVE_FQDN
+System User: $LIVE_USER
+
+EOF
+else
+cat <<EOF
+(Live app provisioning skipped)
+
+EOF
+fi
+
+cat <<EOF
+✅ Manual Steps Required:
+1.  DNS Configuration: Update DNS records for the domain(s) to point to server IP: $SELECTED_SERVER_IP
+    - Staging domain: '$STAGING_DOMAIN'
+    - Live domain: '$LIVE_DOMAIN' (if applicable)
+
+2.  Initial Deployment:
+    - Use your 'smartdeploy' script to deploy your local DDEV project.
+    - Deploy to '$STAGING_APP_LABEL' first for testing.
+    - Then deploy to '$LIVE_APP_LABEL' (if applicable).
+EOF
